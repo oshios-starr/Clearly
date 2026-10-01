@@ -1,0 +1,17 @@
+[project]
+name = "clearly-cli"
+version = "0.1.0"
+description = "Clearly - AI debugging assistant CLI"
+requires-python = ">=3.9"
+dependencies = ["requests"]
+
+[project.scripts]
+clearly = "cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["cli"]
+packages = []

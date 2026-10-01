@@ -1,0 +1,8 @@
+cli.py
+pyproject.toml
+clearly_cli.egg-info/PKG-INFO
+clearly_cli.egg-info/SOURCES.txt
+clearly_cli.egg-info/dependency_links.txt
+clearly_cli.egg-info/entry_points.txt
+clearly_cli.egg-info/requires.txt
+clearly_cli.egg-info/top_level.txt
