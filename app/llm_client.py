@@ -1,66 +1,154 @@
-# app/llm_client.py
 import json
 import time
+
+import resend
+from openai import OpenAI, APIStatusError
 from google import genai
 from google.genai import types
-from app.config import GOOGLE_API_KEY, GEMINI_MODEL
+
+from app.config import (
+    OPENROUTER_API_KEY,
+    LLM_MODEL,
+    GOOGLE_API_KEY,
+    GEMINI_MODEL,
+    RESEND_API_KEY,
+    ALERT_EMAIL_TO,
+    ALERT_EMAIL_FROM,
+)
 from app.prompt_builder import SYSTEM_PROMPT, build_prompt
 from app.models import ExplainRequest, ExplainResponse
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
+# OpenRouter speaks the OpenAI API, so we use the OpenAI SDK pointed at it.
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
 
-RESPONSE_SCHEMA = {
+# Once OpenRouter says the credit is gone (HTTP 402), stop trying it for the
+# rest of this process's life. Note: on Render's free tier the process
+# restarts after sleeping, which resets these flags.
+_primary_exhausted = False
+_alert_sent = False
+
+MAX_RETRIES = 3
+
+GEMINI_RESPONSE_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "explanation": {"type": "STRING"},
         "fix_suggestion": {"type": "STRING"},
         "confidence": {"type": "STRING", "enum": ["high", "medium", "low"]},
-        # nullable: true is what allows the model to explicitly return
-        # JSON null here instead of being forced to invent some string —
-        # this is what makes the "only auto-fix when it's actually safe"
-        # rule from the system prompt enforceable at the schema level,
-        # not just something we're hoping the model respects.
         "fixed_line": {"type": "STRING", "nullable": True},
     },
-    # fixed_line is deliberately NOT in this list — that's what makes it
-    # optional/nullable rather than a value the model is forced to fill.
     "required": ["explanation", "fix_suggestion", "confidence"],
 }
 
-MAX_RETRIES = 3
+EXPLAIN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_explanation",
+        "description": "Submit the structured explanation of the code error.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "explanation": {"type": "string"},
+                "fix_suggestion": {"type": "string"},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                "fixed_line": {"type": ["string", "null"]},
+            },
+            "required": ["explanation", "fix_suggestion", "confidence"],
+        },
+    },
+}
+
+
+def _send_fallback_alert(reason):
+    """Best-effort email to the developer. Never allowed to break a request."""
+    if not (RESEND_API_KEY and ALERT_EMAIL_TO):
+        print("Alert email not configured (RESEND_API_KEY / ALERT_EMAIL_TO) -- skipping.")
+        return
+    try:
+        resend.api_key = RESEND_API_KEY
+        resend.Emails.send({
+            "from": ALERT_EMAIL_FROM,
+            "to": [ALERT_EMAIL_TO],
+            "subject": "Clearly: switched from Claude to Gemini",
+            "text": (
+                "Clearly's backend just switched from the primary model to Gemini "
+                f"because:\n\n{reason}\n\n"
+                "The primary model won't be tried again until the process restarts "
+                "or you top up your OpenRouter credits."
+            ),
+        })
+        print("Sent fallback alert email.")
+    except Exception as e:
+        print(f"Could not send fallback alert email: {e}")
+
+
+def _get_explanation_primary(user_message):
+    response = openrouter_client.chat.completions.create(
+        model=LLM_MODEL,
+        max_tokens=800,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        tools=[EXPLAIN_TOOL],
+        tool_choice={"type": "function", "function": {"name": "submit_explanation"}},
+    )
+    tool_calls = response.choices[0].message.tool_calls
+    if not tool_calls:
+        raise ValueError("Model did not return a structured tool call.")
+    return ExplainResponse(**json.loads(tool_calls[0].function.arguments))
+
+
+def _get_explanation_gemini(user_message):
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=user_message,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=800,
+            response_mime_type="application/json",
+            response_schema=GEMINI_RESPONSE_SCHEMA,
+        ),
+    )
+    raw_text = response.text
+    if not raw_text:
+        raise ValueError("Gemini returned an empty response.")
+    return ExplainResponse(**json.loads(raw_text))
 
 
 def get_explanation(request: ExplainRequest, code_context: str) -> ExplainResponse:
+    global _primary_exhausted, _alert_sent
+
     user_message = build_prompt(request, code_context)
 
-    last_error = None
+    if not _primary_exhausted:
+        last_error = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return _get_explanation_primary(user_message)
+            except APIStatusError as e:
+                if e.status_code == 402:
+                    # Out of credit: not transient. Switch for good, alert once.
+                    _primary_exhausted = True
+                    if not _alert_sent:
+                        _alert_sent = True
+                        _send_fallback_alert(f"OpenRouter billing error (HTTP 402): {e.message}")
+                    break
+                last_error = e
+                print(f"Primary attempt {attempt} failed ({e.status_code}): {e}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(attempt)
+            except Exception as e:
+                last_error = e
+                print(f"Primary attempt {attempt} failed: {e}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(attempt)
+        else:
+            # Transient failure: Gemini covers this one request only.
+            print(f"Primary failed {MAX_RETRIES} times, using Gemini for this request: {last_error}")
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=user_message,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=800,
-                    response_mime_type="application/json",
-                    response_schema=RESPONSE_SCHEMA,
-                ),
-            )
-
-            raw_text = response.text
-            if not raw_text:
-                raise ValueError("Model returned an empty response.")
-
-            parsed = json.loads(raw_text)
-            return ExplainResponse(**parsed)
-
-        except Exception as e:
-            last_error = e
-            print(f"Attempt {attempt} failed: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(attempt)
-
-    raise ValueError(
-        f"Failed after {MAX_RETRIES} attempts. Last error: {last_error}"
-    )
+    return _get_explanation_gemini(user_message)
