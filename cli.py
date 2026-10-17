@@ -6,7 +6,13 @@ import shutil
 import subprocess
 import requests
 
-BACKEND_URL = "http://localhost:8000/explain"
+# Live backend. Override for local development with:
+#   $env:CLEARLY_BACKEND_URL="http://localhost:8000"   (PowerShell)
+BASE_URL = os.environ.get(
+    "CLEARLY_BACKEND_URL", "https://clearly-2176.onrender.com"
+).rstrip("/")
+EXPLAIN_URL = BASE_URL + "/explain"
+HEALTH_URL = BASE_URL + "/health"
 
 
 def get_language_and_runner(script_path):
@@ -57,7 +63,7 @@ def parse_node_traceback(stderr_text):
 
     file_path = None
     line_number = None
-    frame_pattern = re.compile(r'^\s*at\s+(?:.*\()?(.+):(\d+):(\d+)\)?\s*$')
+    frame_pattern = re.compile(r"^\s*at\s+(?:.*\()?(.+):(\d+):(\d+)\)?\s*$")
     for line in lines:
         m = frame_pattern.match(line)
         if not m:
@@ -76,6 +82,26 @@ def parse_node_traceback(stderr_text):
     return file_path, line_number, error_message
 
 
+def wake_server():
+    """
+    The free hosting tier puts the server to sleep when idle. Check if it's
+    awake; if not, tell the user and wait for it (up to ~90 seconds).
+    """
+    try:
+        r = requests.get(HEALTH_URL, timeout=5)
+        if r.ok:
+            return
+    except requests.exceptions.RequestException:
+        pass
+
+    print("Waking up the Clearly server - this can take up to a minute "
+          "the first time...\n")
+    try:
+        requests.get(HEALTH_URL, timeout=90)
+    except requests.exceptions.RequestException:
+        pass  # the real request below will report any problem
+
+
 def get_explanation(error_message, stack_trace, file_content, error_line, language):
     payload = {
         "error_message": error_message,
@@ -84,7 +110,7 @@ def get_explanation(error_message, stack_trace, file_content, error_line, langua
         "error_line": error_line,
         "language": language,
     }
-    response = requests.post(BACKEND_URL, json=payload)
+    response = requests.post(EXPLAIN_URL, json=payload, timeout=60)
     response.raise_for_status()
     return response.json()
 
@@ -152,7 +178,7 @@ def main():
         file_path, error_line, error_message = parse_node_traceback(stderr)
 
     if file_path is None:
-        print("Couldn't parse a stack trace from this error — nothing to analyze.")
+        print("Couldn't parse a stack trace from this error - nothing to analyze.")
         sys.exit(1)
 
     try:
@@ -162,12 +188,16 @@ def main():
         print(f"Couldn't read {file_path} to gather code context.")
         sys.exit(1)
 
+    wake_server()
+
     try:
         result = get_explanation(error_message, stderr, file_content, error_line, language)
         print_result(result)
+    except requests.exceptions.Timeout:
+        print("The Clearly server took too long to respond. Please try again in a moment.")
+        return
     except requests.exceptions.ConnectionError:
-        print("Couldn't reach the Clearly backend. Is it running?")
-        print("Start it with: uvicorn app.main:app --reload --port 8000")
+        print("Couldn't reach the Clearly server. Check your internet connection and try again.")
         return
     except Exception as e:
         print(f"Clearly hit an error explaining this: {e}")
@@ -181,7 +211,7 @@ def main():
     print(f"  {fixed_line.strip()}\n")
     choice = input("Apply this fix? [y/N]: ").strip().lower()
     if choice != "y":
-        print("Skipped — no changes made.")
+        print("Skipped - no changes made.")
         return
 
     backup_path = apply_fixed_line(file_path, error_line, fixed_line)
@@ -195,9 +225,9 @@ def main():
         print("-----------------------")
 
     if returncode == 0:
-        print("Success — the script now runs without error.")
+        print("Success - the script now runs without error.")
     else:
-        print("Still failing after the fix — here's the new error:")
+        print("Still failing after the fix - here's the new error:")
         print(stderr)
 
 
