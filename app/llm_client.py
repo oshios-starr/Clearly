@@ -63,6 +63,31 @@ EXPLAIN_TOOL = {
 }
 
 
+def _clean_response(result, request):
+    """
+    Some models double-escape quotes inside tool-call arguments, so text comes
+    back as  order.get(\\"amount\\", 0)  instead of  order.get("amount", 0).
+    Writing that into a file would break it, so undo it.
+
+    - Prose fields: a backslash-quote is never intended, always unescape.
+    - fixed_line: only unescape if the ORIGINAL line has no backslash-quote,
+      so code that legitimately contains one is left alone.
+    """
+    def unescape(text):
+        return text.replace('\\"', '"')
+
+    result.explanation = unescape(result.explanation)
+    result.fix_suggestion = unescape(result.fix_suggestion)
+
+    if result.fixed_line and '\\"' in result.fixed_line:
+        lines = request.file_content.splitlines()
+        idx = request.error_line - 1
+        original = lines[idx] if 0 <= idx < len(lines) else ""
+        if '\\"' not in original:
+            result.fixed_line = unescape(result.fixed_line)
+    return result
+
+
 def _send_fallback_alert(reason):
     """Best-effort email to the developer. Never allowed to break a request."""
     if not (RESEND_API_KEY and ALERT_EMAIL_TO):
@@ -86,7 +111,7 @@ def _send_fallback_alert(reason):
         print(f"Could not send fallback alert email: {e}")
 
 
-def _get_explanation_primary(user_message):
+def _get_explanation_primary(user_message, request):
     response = openrouter_client.chat.completions.create(
         model=LLM_MODEL,
         max_tokens=800,
@@ -100,10 +125,11 @@ def _get_explanation_primary(user_message):
     tool_calls = response.choices[0].message.tool_calls
     if not tool_calls:
         raise ValueError("Model did not return a structured tool call.")
-    return ExplainResponse(**json.loads(tool_calls[0].function.arguments))
+    result = ExplainResponse(**json.loads(tool_calls[0].function.arguments))
+    return _clean_response(result, request)
 
 
-def _get_explanation_gemini(user_message):
+def _get_explanation_gemini(user_message, request):
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
         contents=user_message,
@@ -117,7 +143,8 @@ def _get_explanation_gemini(user_message):
     raw_text = response.text
     if not raw_text:
         raise ValueError("Gemini returned an empty response.")
-    return ExplainResponse(**json.loads(raw_text))
+    result = ExplainResponse(**json.loads(raw_text))
+    return _clean_response(result, request)
 
 
 def get_explanation(request: ExplainRequest, code_context: str) -> ExplainResponse:
@@ -129,7 +156,7 @@ def get_explanation(request: ExplainRequest, code_context: str) -> ExplainRespon
         last_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return _get_explanation_primary(user_message)
+                return _get_explanation_primary(user_message, request)
             except APIStatusError as e:
                 if e.status_code == 402:
                     # Out of credit: not transient. Switch for good, alert once.
@@ -151,4 +178,4 @@ def get_explanation(request: ExplainRequest, code_context: str) -> ExplainRespon
             # Transient failure: Gemini covers this one request only.
             print(f"Primary failed {MAX_RETRIES} times, using Gemini for this request: {last_error}")
 
-    return _get_explanation_gemini(user_message)
+    return _get_explanation_gemini(user_message, request)
