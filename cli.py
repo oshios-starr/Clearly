@@ -4,6 +4,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import codecs
+import locale
 import requests
 
 # Live backend. Override for local development with:
@@ -27,12 +30,46 @@ def get_language_and_runner(script_path):
 
 
 def run_target_script(runner_command):
-    result = subprocess.run(
-        runner_command,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode, result.stdout, result.stderr
+    """
+    Run the user's script so it behaves like it would in a normal terminal:
+    its output and its input() / readline prompts appear live, and the user's
+    keyboard works. Only stderr is copied (and echoed live) so Clearly can read
+    the error afterwards. Returns (returncode, stderr_text).
+    """
+    proc = subprocess.Popen(runner_command, stderr=subprocess.PIPE)
+    chunks = []
+
+    def pump():
+        decoder = codecs.getincrementaldecoder(
+            locale.getpreferredencoding(False) or "utf-8"
+        )(errors="replace")
+        while True:
+            data = proc.stderr.read1(4096)
+            if not data:
+                break
+            text = decoder.decode(data)
+            chunks.append(text)
+            sys.stderr.write(text)
+            sys.stderr.flush()
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            chunks.append(tail)
+            sys.stderr.write(tail)
+            sys.stderr.flush()
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        # Ctrl+C also reaches the script itself; give it a moment to exit.
+        try:
+            returncode = proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            returncode = 130
+    reader.join(timeout=5)
+    return returncode, "".join(chunks)
 
 
 def parse_python_traceback(stderr_text):
@@ -144,6 +181,39 @@ def apply_fixed_line(file_path, error_line, fixed_line):
     return backup_path
 
 
+def offer_fix(result, script_path, runner_command, file_path, error_line):
+    """
+    Offer the one-line fix. Returns what happened: "no_fix_offered",
+    "declined", "applied_worked" or "applied_still_failing".
+    """
+    fixed_line = result.get("fixed_line")
+    if not fixed_line:
+        return "no_fix_offered"
+
+    print(f"Clearly can apply this one-line fix automatically:\n")
+    print(f"  {fixed_line.strip()}\n")
+    try:
+        choice = input("Apply this fix? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        choice = ""
+    if choice != "y":
+        print("Skipped - no changes made.")
+        return "declined"
+
+    backup_path = apply_fixed_line(file_path, error_line, fixed_line)
+    print(f"Applied. Original saved to {backup_path}")
+    print(f"\nRe-running {script_path} to confirm the fix...\n")
+
+    returncode, stderr = run_target_script(runner_command)
+
+    if returncode == 0:
+        print("\nSuccess - the script now runs without error.")
+        return "applied_worked"
+    print("\nStill failing after the fix - see the new error above.")
+    return "applied_still_failing"
+
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: clearly <script_to_run.py|.js>")
@@ -158,24 +228,22 @@ def main():
         sys.exit(1)
 
     print(f"Running {script_path} ...\n")
-    returncode, stdout, stderr = run_target_script(runner_command)
-
-    if stdout:
-        print("--- Program output ---")
-        print(stdout, end="" if stdout.endswith(chr(10)) else chr(10))
-        print("-----------------------")
+    returncode, stderr = run_target_script(runner_command)
 
     if returncode == 0:
-        print("Ran successfully, no errors.")
+        print("\nRan successfully, no errors.")
         return
-
-    print(stderr)
-    print("Analyzing the error with Clearly...\n")
 
     if language == "python":
         file_path, error_line, error_message = parse_python_traceback(stderr)
     else:  # javascript
         file_path, error_line, error_message = parse_node_traceback(stderr)
+
+    if error_message and error_message.strip().startswith("KeyboardInterrupt"):
+        print("\nStopped by you (Ctrl+C) - nothing to analyze.")
+        return
+
+    print("\nAnalyzing the error with Clearly...\n")
 
     if file_path is None:
         print("Couldn't parse a stack trace from this error - nothing to analyze.")
@@ -203,32 +271,7 @@ def main():
         print(f"Clearly hit an error explaining this: {e}")
         return
 
-    fixed_line = result.get("fixed_line")
-    if not fixed_line:
-        return
-
-    print(f"Clearly can apply this one-line fix automatically:\n")
-    print(f"  {fixed_line.strip()}\n")
-    choice = input("Apply this fix? [y/N]: ").strip().lower()
-    if choice != "y":
-        print("Skipped - no changes made.")
-        return
-
-    backup_path = apply_fixed_line(file_path, error_line, fixed_line)
-    print(f"Applied. Original saved to {backup_path}")
-    print(f"\nRe-running {script_path} to confirm the fix...\n")
-
-    returncode, stdout, stderr = run_target_script(runner_command)
-    if stdout:
-        print("--- Program output ---")
-        print(stdout, end="" if stdout.endswith(chr(10)) else chr(10))
-        print("-----------------------")
-
-    if returncode == 0:
-        print("Success - the script now runs without error.")
-    else:
-        print("Still failing after the fix - here's the new error:")
-        print(stderr)
+    offer_fix(result, script_path, runner_command, file_path, error_line)
 
 
 if __name__ == "__main__":
