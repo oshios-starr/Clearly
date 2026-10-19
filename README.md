@@ -73,4 +73,4 @@ Screenshots of anything wrong or confusing are the most useful.
 
 ## Status
 
-Early prototype, built by Itsuokor Emmanuel (Oshios).
+Early prototype, built by Itsuokor Emmanuel Oshioriamhe(Oshios), 300 level computer Engineering, Covenant University.
