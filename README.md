@@ -53,6 +53,8 @@ Programs that ask you questions (using `input()`) work normally.
 - **`clearly` is not recognized:** you probably skipped the restart. Close VS Code completely and open it again. Or run `python -m cli yourfile.py`, which does the same thing.
 - **`python` is not recognized (Windows):** use `py` instead, for example `py -m pip install --user pipx`.
 - **To update to the newest version:**
+- And if in case it shows the message below about no module named pip, Do this:
+- - **`No module named pip`:** your Python was installed without pip. Run `python -m ensurepip --upgrade`,close your vscode anfter the reinstall and repeat the install steps.
 ```
   pipx install --force https://github.com/oshios-starr/Clearly/archive/refs/heads/main.zip
 ```
