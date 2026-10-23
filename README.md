@@ -63,7 +63,7 @@ Programs that ask you questions (using `input()`) work normally.
 
 This is an early version, and I'm looking for testers. After you try it, please fill in this 2-minute form:
 
-**[YOUR FORM LINK HERE]**
+https://docs.google.com/forms/d/e/1FAIpQLSfzl54xCaEZN1eYpaLRwUr_npz_7Z6XDIRgHdVNadTYcFhXWw/viewform?usp=dialog
 
 I want to know:
 
