@@ -65,3 +65,48 @@ class ExplainResponse(BaseModel):
     # doesn't fit on one line is how you corrupt someone's file, so we
     # deliberately don't attempt it.
     fixed_line: Optional[str] = None
+    # ---------------------------------------------------------------------------
+# /analyze: find and fix EVERY problem in the file in one run
+# (paste this at the bottom of app/models.py; the imports at the top of the
+#  file already cover BaseModel, Field and Optional)
+# ---------------------------------------------------------------------------
+
+class AnalyzeRequest(BaseModel):
+    """Same inputs as /explain. The CLI now sends the whole file."""
+
+    error_message: str
+    stack_trace: Optional[str] = None
+    file_content: str
+    error_line: int = Field(gt=0, description="Must be a positive line number")
+    language: str = "python"
+
+
+class Problem(BaseModel):
+    """One thing wrong in the file, with the exact edit that fixes it."""
+
+    # 1-based lines this problem's edit touches (0 = not tied to a line).
+    line: int = 0
+    end_line: int = 0
+
+    # "crash" = the program would stop here. "logic" = looks wrong but wouldn't crash.
+    kind: str = "crash"
+
+    title: str
+    explanation: str  # plain English: what went wrong and why
+
+    # replace | insert_before | delete | none
+    # If op is "none" and `new` is set, `new` is only a suggestion, not an edit.
+    op: str = "none"
+    old: Optional[str] = None  # exact current text of lines line..end_line
+    new: Optional[str] = None  # replacement text, or the text to insert
+
+    confidence: str = "medium"  # high | medium | low
+
+    # True when there were several reasonable fixes and one was picked for you.
+    needs_decision: bool = False
+    decision_note: Optional[str] = None
+
+
+class AnalyzeResponse(BaseModel):
+    summary: str
+    problems: list[Problem]
